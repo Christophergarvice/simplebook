@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+
+# Local runtime data
+data/
+*.db
+
+# IDE
+.idea/
+
+# Backups
+*.bak
+*.before_cleanup
+*.bak_needs_review
+
+# Pytest cache
+.pytest_cache/
+
+# macOS
+.DS_Store
+

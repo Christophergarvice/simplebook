@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import sys
 import os
-
-DEBUG = os.getenv("SB_DEBUG") == "1"
+import sys
 
 from ingest.qfx.qfx_ingest import ingest_qfx
 from ledger.sqlite_store import SQLiteStore
 from reports.basic_summary import summarize
+from modules.module3_checks import detect_checks, print_check_debug_sample
 
+DEBUG = os.getenv("SB_DEBUG") == "1"
 DB_PATH = "data/simplebook.db"
+
 
 def cmd_import(args: list[str]) -> None:
     if len(args) != 1:
@@ -31,7 +32,6 @@ def cmd_import(args: list[str]) -> None:
 
 
 def cmd_months(args: list[str]) -> None:
-    # Optional: allow "sb months <limit>"
     limit = 60
     if len(args) == 1:
         try:
@@ -70,30 +70,10 @@ def cmd_report(args: list[str]) -> None:
 
     txs = store.list_by_month(year, month, limit=10000)
 
-    # Diagnostic: detect check-like txs
-    checks = [
-        t for t in txs
-        if (
-            t.checknum
-            or ((t.type or "").upper() == "CHECK")
-            or ("CHECK" in (t.name or "").upper())
-        )
-    ]
-    print("Detected checks:", len(checks))
-
-    # Optional: show one sample check raw mapping
-    if checks:
-        sample = checks[0]
-        print("\nSample check transaction raw:")
-        print("name:", sample.name)
-        print("memo:", sample.memo)
-        print("type:", sample.type)
-        print("checknum:", sample.checknum)
-        if sample.raw:
-            print("raw keys:", list(sample.raw.keys()))
-            for k in ["checknum", "fitid", "trntype", "name", "memo", "posted_raw", "posted_date", "amount"]:
-                if k in sample.raw:
-                    print(f"raw[{k}]:", sample.raw[k])
+    # Module 3: check detection + optional debug dump
+    checks = detect_checks(txs)
+    if DEBUG:
+        print_check_debug_sample(checks)
 
     s = summarize(txs)
 
@@ -103,25 +83,19 @@ def cmd_report(args: list[str]) -> None:
     print("Debits :", s.debits_count, "Total:", s.debits_total)
     print("Net    :", s.net_total)
 
-    # Optional: Top spending (disabled for now)
-    # We’ll re-add once report output is stabilized.
-
     print("\nTop spend breakdown: (disabled for now)")
 
     # --- Needs Review (v0.1) ---
     needs_review: list[tuple[object, str]] = []
-
     for t in txs:
         amt = abs(float(t.amount or 0))
         name_u = (t.name or "").upper().strip()
         memo_s = (t.memo or "").strip()
 
-        # Rule 1: large transaction with no memo
         if amt >= 500 and not memo_s:
             needs_review.append((t, "large amount, missing memo"))
             continue
 
-        # Rule 2: generic or missing name
         if not name_u or name_u in {"POS", "ONLINE", "PAYMENT"}:
             needs_review.append((t, "generic or missing name"))
             continue
@@ -132,30 +106,6 @@ def cmd_report(args: list[str]) -> None:
             print(f"  {t.posted_date}  {t.amount:10.2f}  {t.name}  ({reason})")
     else:
         print("\nNeeds Review: none")
-
-def cmd_months(args: list[str]) -> None:
-    limit = 60
-    if len(args) == 1:
-        try:
-            limit = int(args[0])
-        except ValueError:
-            print("Usage: sb months [limit]")
-            sys.exit(1)
-    elif len(args) > 1:
-        print("Usage: sb months [limit]")
-        sys.exit(1)
-
-    store = SQLiteStore("data/simplebook.db")
-    store.init_db()
-
-    months = store.list_months()
-    if not months:
-        print("No transactions found in DB.")
-        return
-
-    print("\nMonths in DB (newest first):")
-    for ym, c in months[:limit]:
-        print(f"{ym}  ({c})")
 
 
 def main() -> None:
@@ -178,6 +128,7 @@ def main() -> None:
         sys.exit(1)
 
 
-
 if __name__ == "__main__":
     main()
+
+
