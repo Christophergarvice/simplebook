@@ -8,6 +8,13 @@ from ingest.qfx.qfx_ingest import ingest_qfx
 from ledger.sqlite_store import SQLiteStore
 from reports.basic_summary import summarize
 from modules.module3_checks import detect_checks, print_check_debug_sample
+from ledger.review_store import (
+    load_review_items,
+    save_review_items,
+    upsert_review_item,
+    find_next_open,
+    make_review_id,
+)
 
 DEBUG = os.getenv("SB_DEBUG") == "1"
 DB_PATH = "data/simplebook.db"
@@ -126,7 +133,121 @@ def main() -> None:
     else:
         print(f"Unknown command: {command}")
         sys.exit(1)
+def _build_needs_review(txs: list[object]) -> list[tuple[object, str]]:
+    needs: list[tuple[object, str]] = []
+    for t in txs:
+        amt = abs(float(getattr(t, "amount", 0) or 0))
+        name = (getattr(t, "name", "") or "").strip()
+        memo = (getattr(t, "memo", "") or "").strip()
 
+        # v0.1 heuristic (aggressive)
+        if amt >= 500 and not memo:
+            needs.append((t, "large amount, missing memo"))
+            continue
+
+        if not name:
+            needs.append((t, "missing name"))
+            continue
+
+    return needs
+
+
+def cmd_review(args: list[str]) -> None:
+    if len(args) != 1 or "-" not in args[0]:
+        print("Usage: sb review YYYY-MM")
+        sys.exit(1)
+
+    ym = args[0]
+    year_s, month_s = ym.split("-", 1)
+    year = int(year_s)
+    month = int(month_s)
+
+    store = SQLiteStore(DB_PATH)
+    store.init_db()
+    txs = store.list_by_month(year, month, limit=100000)
+
+    needs = _build_needs_review(txs)
+
+    items = load_review_items(ym)
+
+    added = 0
+    for t, reason in needs:
+        rid = make_review_id(t)
+        base = {
+            "id": rid,
+            "ym": ym,
+            "posted_date": getattr(t, "posted_date", None),
+            "amount": float(getattr(t, "amount", 0) or 0),
+            "name": getattr(t, "name", None),
+            "memo": getattr(t, "memo", None),
+            "reason": reason,
+        }
+        if rid not in items:
+            added += 1
+        upsert_review_item(items, rid, base)
+
+    save_review_items(ym, items)
+
+    open_count = sum(1 for v in items.values() if v.get("status", "open") == "open")
+    resolved_count = sum(1 for v in items.values() if v.get("status") == "resolved")
+
+    print(f"Review file updated: data/review_{ym}.jsonl")
+    print(f"Found needs_review this run: {len(needs)} (new: {added})")
+    print(f"Open: {open_count} | Resolved: {resolved_count}")
+    print(f"Next: python3 sb.py review-next {ym}")
+
+
+def cmd_review_next(args: list[str]) -> None:
+    if len(args) != 1 or "-" not in args[0]:
+        print("Usage: sb review-next YYYY-MM")
+        sys.exit(1)
+
+    ym = args[0]
+    items = load_review_items(ym)
+    nxt = find_next_open(items)
+    if not nxt:
+        print(f"No open review items for {ym}. 🎉")
+        return
+
+    print("\nNEXT REVIEW ITEM")
+    print("ID        :", nxt.get("id"))
+    print("Date      :", nxt.get("posted_date"))
+    print("Amount    :", f'{nxt.get("amount", 0):.2f}')
+    print("Name      :", nxt.get("name"))
+    print("Memo      :", nxt.get("memo"))
+    print("Reason    :", nxt.get("reason"))
+    print("\nTo resolve it, run something like:")
+    print(f'python3 sb.py review-set {ym} {nxt.get("id")} status=resolved category="Materials" vendor="Home Depot" note="lot 12 remodel"')
+
+
+def cmd_review_set(args: list[str]) -> None:
+    if len(args) < 3:
+        print('Usage: sb review-set YYYY-MM <id> key=value [key=value ...]')
+        sys.exit(1)
+
+    ym = args[0]
+    rid = args[1]
+    kvs = args[2:]
+
+    items = load_review_items(ym)
+    obj = items.get(rid)
+    if not obj:
+        print(f"Review id not found: {rid}")
+        print(f"Tip: run: python3 sb.py review {ym}")
+        sys.exit(1)
+
+    for kv in kvs:
+        if "=" not in kv:
+            print(f"Bad field (expected key=value): {kv}")
+            sys.exit(1)
+        k, v = kv.split("=", 1)
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        obj[k] = v
+
+    items[rid] = obj
+    save_review_items(ym, items)
+    print(f"Updated {rid} in data/review_{ym}.jsonl")
 
 if __name__ == "__main__":
     main()
