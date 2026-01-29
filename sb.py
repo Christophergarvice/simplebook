@@ -130,6 +130,12 @@ def main() -> None:
         cmd_months(args)
     elif command == "report":
         cmd_report(args)
+    elif command == "review":
+        cmd_review(args)
+    elif command == "review-next":
+        cmd_review_next(args)
+    elif command == "review-set":
+        cmd_review_set(args)
     else:
         print(f"Unknown command: {command}")
         sys.exit(1)
@@ -248,6 +254,109 @@ def cmd_review_set(args: list[str]) -> None:
     items[rid] = obj
     save_review_items(ym, items)
     print(f"Updated {rid} in data/review_{ym}.jsonl")
+def _parse_ym(args: list[str]) -> tuple[int, int, str]:
+    if len(args) < 1 or "-" not in args[0]:
+        print("Usage: sb review YYYY-MM")
+        sys.exit(1)
+    ym = args[0]
+    y_s, m_s = ym.split("-", 1)
+    return int(y_s), int(m_s), ym
+
+
+def cmd_review(args: list[str]) -> None:
+    year, month, ym = _parse_ym(args)
+
+    store = SQLiteStore(DB_PATH)
+    store.init_db()
+    txs = store.list_by_month(year, month, limit=100000)
+
+    items = load_review_items(ym)
+
+    # Build/refresh review items based on current rules
+    for t in txs:
+        amt = abs(float(t.amount or 0))
+        name_u = (t.name or "").upper().strip()
+        memo_s = (t.memo or "").strip()
+
+        reason = None
+        if amt >= 500 and not memo_s:
+            reason = "large amount, missing memo"
+        elif not name_u or name_u in {"POS", "ONLINE", "PAYMENT"}:
+            reason = "generic or missing name"
+
+        if not reason:
+            continue
+
+        rid = make_review_id(t)
+        base = {
+            "id": rid,
+            "ym": ym,
+            "posted_date": t.posted_date,
+            "amount": float(t.amount or 0),
+            "name": t.name,
+            "memo": t.memo,
+            "reason": reason,
+        }
+        upsert_review_item(items, rid, base)
+
+    save_review_items(ym, items)
+
+    open_ct = sum(1 for v in items.values() if v.get("status", "open") == "open")
+    resolved_ct = sum(1 for v in items.values() if v.get("status") == "resolved")
+
+    print(f"[review] {ym} saved -> data/review_{ym}.jsonl")
+    print(f"Open: {open_ct}  Resolved: {resolved_ct}  Total: {len(items)}")
+
+
+def cmd_review_next(args: list[str]) -> None:
+    year, month, ym = _parse_ym(args)
+
+    items = load_review_items(ym)
+    nxt = find_next_open(items)
+    if not nxt:
+        print(f"[review-next] {ym}: no open items 🎉")
+        return
+
+    rid = nxt["id"]
+    print(f"[review-next] {ym}")
+    print(f"ID     : {rid}")
+    print(f"Date   : {nxt.get('posted_date')}")
+    print(f"Amount : {nxt.get('amount')}")
+    print(f"Name   : {nxt.get('name')}")
+    memo = (nxt.get("memo") or "").strip()
+    if memo:
+        print(f"Memo   : {memo}")
+    print(f"Reason : {nxt.get('reason')}")
+    print("")
+    print("Resolve example:")
+    print(f'  python3 sb.py review-set {ym} "{rid}" status=resolved category="..." vendor="..." note="..."')
+
+
+def cmd_review_set(args: list[str]) -> None:
+    if len(args) < 2:
+        print("Usage: sb review-set YYYY-MM <id> key=value [key=value ...]")
+        sys.exit(1)
+
+    ym = args[0]
+    rid = args[1]
+    kvs = args[2:]
+
+    items = load_review_items(ym)
+    if rid not in items:
+        print(f"[review-set] ID not found: {rid}")
+        sys.exit(1)
+
+    for kv in kvs:
+        if "=" not in kv:
+            print(f"[review-set] bad field (expected key=value): {kv}")
+            sys.exit(1)
+        k, v = kv.split("=", 1)
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        items[rid][k] = v
+
+    save_review_items(ym, items)
+    print(f"[review-set] updated {rid}")
 
 if __name__ == "__main__":
     main()
