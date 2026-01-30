@@ -23,3 +23,24 @@ data/
 # macOS
 .DS_Store
 
+# Python caches / env
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Local data (never commit your DB)
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.idea/
+.vscode/
+
+# Backups / scratch
+*.bak
+sb.py.bak_*
+report_month.py
+
