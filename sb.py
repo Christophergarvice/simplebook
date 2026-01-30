@@ -8,6 +8,7 @@ from ingest.qfx.qfx_ingest import ingest_qfx
 from ledger.sqlite_store import SQLiteStore
 from reports.basic_summary import summarize
 from modules.module3_checks import detect_checks, print_check_debug_sample
+from rules.rules_v1 import classify_tx
 from ledger.review_store import (
     load_review_items,
     save_review_items,
@@ -92,179 +93,50 @@ def cmd_report(args: list[str]) -> None:
 
     print("\nTop spend breakdown: (disabled for now)")
 
-    # --- Needs Review (v0.1) ---
+    # --- Needs Review (v0.3) --- (ignores memo)
     needs_review: list[tuple[object, str]] = []
     for t in txs:
         amt = abs(float(t.amount or 0))
         name_u = (t.name or "").upper().strip()
-        memo_s = (t.memo or "").strip()
 
-        if amt >= 500 and not memo_s:
-            needs_review.append((t, "large amount, missing memo"))
+        is_large = amt >= 500
+        is_generic = (not name_u) or (name_u in {"POS", "ONLINE", "PAYMENT"})
+        is_transferish = "TRANSFER" in name_u
+        is_checkish = ("CHECK" in name_u) or bool(getattr(t, "checknum", None))
+
+        # Flag large items that are ambiguous / need human labeling
+        if is_large and (is_generic or is_transferish or is_checkish):
+            needs_review.append((t, "large + needs classification"))
             continue
 
-        if not name_u or name_u in {"POS", "ONLINE", "PAYMENT"}:
+        # Flag generic names even if not large
+        if is_generic:
             needs_review.append((t, "generic or missing name"))
             continue
 
     if needs_review:
         print("\nNeeds Review:")
         for t, reason in needs_review[:15]:
-            print(f"  {t.posted_date}  {t.amount:10.2f}  {t.name}  ({reason})")
+            r = classify_tx(t)
+            cat = r.category or "Uncategorized"
+            note = f" | {r.note}" if r.note else ""
+            print(f"  {t.posted_date}  {t.amount:10.2f}  {t.name}  [{cat}]{note}  ({reason})")
     else:
         print("\nNeeds Review: none")
 
 
-def main() -> None:
-    if len(sys.argv) < 2:
-        print("Usage: sb <command> [args]")
-        print("Commands: import, months, report")
+def _parse_ym(args: list[str], usage: str) -> str:
+    if len(args) != 1 or "-" not in args[0]:
+        print(usage)
         sys.exit(1)
-
-    command = sys.argv[1]
-    args = sys.argv[2:]
-
-    if command == "import":
-        cmd_import(args)
-    elif command == "months":
-        cmd_months(args)
-    elif command == "report":
-        cmd_report(args)
-    elif command == "review":
-        cmd_review(args)
-    elif command == "review-next":
-        cmd_review_next(args)
-    elif command == "review-set":
-        cmd_review_set(args)
-    else:
-        print(f"Unknown command: {command}")
-        sys.exit(1)
-def _build_needs_review(txs: list[object]) -> list[tuple[object, str]]:
-    needs: list[tuple[object, str]] = []
-    for t in txs:
-        amt = abs(float(getattr(t, "amount", 0) or 0))
-        name = (getattr(t, "name", "") or "").strip()
-        memo = (getattr(t, "memo", "") or "").strip()
-
-        # v0.1 heuristic (aggressive)
-        if amt >= 500 and not memo:
-            needs.append((t, "large amount, missing memo"))
-            continue
-
-        if not name:
-            needs.append((t, "missing name"))
-            continue
-
-    return needs
+    return args[0]
 
 
 def cmd_review(args: list[str]) -> None:
-    if len(args) != 1 or "-" not in args[0]:
-        print("Usage: sb review YYYY-MM")
-        sys.exit(1)
-
-    ym = args[0]
+    ym = _parse_ym(args, "Usage: sb review YYYY-MM")
     year_s, month_s = ym.split("-", 1)
     year = int(year_s)
     month = int(month_s)
-
-    store = SQLiteStore(DB_PATH)
-    store.init_db()
-    txs = store.list_by_month(year, month, limit=100000)
-
-    needs = _build_needs_review(txs)
-
-    items = load_review_items(ym)
-
-    added = 0
-    for t, reason in needs:
-        rid = make_review_id(t)
-        base = {
-            "id": rid,
-            "ym": ym,
-            "posted_date": getattr(t, "posted_date", None),
-            "amount": float(getattr(t, "amount", 0) or 0),
-            "name": getattr(t, "name", None),
-            "memo": getattr(t, "memo", None),
-            "reason": reason,
-        }
-        if rid not in items:
-            added += 1
-        upsert_review_item(items, rid, base)
-
-    save_review_items(ym, items)
-
-    open_count = sum(1 for v in items.values() if v.get("status", "open") == "open")
-    resolved_count = sum(1 for v in items.values() if v.get("status") == "resolved")
-
-    print(f"Review file updated: data/review_{ym}.jsonl")
-    print(f"Found needs_review this run: {len(needs)} (new: {added})")
-    print(f"Open: {open_count} | Resolved: {resolved_count}")
-    print(f"Next: python3 sb.py review-next {ym}")
-
-
-def cmd_review_next(args: list[str]) -> None:
-    if len(args) != 1 or "-" not in args[0]:
-        print("Usage: sb review-next YYYY-MM")
-        sys.exit(1)
-
-    ym = args[0]
-    items = load_review_items(ym)
-    nxt = find_next_open(items)
-    if not nxt:
-        print(f"No open review items for {ym}. 🎉")
-        return
-
-    print("\nNEXT REVIEW ITEM")
-    print("ID        :", nxt.get("id"))
-    print("Date      :", nxt.get("posted_date"))
-    print("Amount    :", f'{nxt.get("amount", 0):.2f}')
-    print("Name      :", nxt.get("name"))
-    print("Memo      :", nxt.get("memo"))
-    print("Reason    :", nxt.get("reason"))
-    print("\nTo resolve it, run something like:")
-    print(f'python3 sb.py review-set {ym} {nxt.get("id")} status=resolved category="Materials" vendor="Home Depot" note="lot 12 remodel"')
-
-
-def cmd_review_set(args: list[str]) -> None:
-    if len(args) < 3:
-        print('Usage: sb review-set YYYY-MM <id> key=value [key=value ...]')
-        sys.exit(1)
-
-    ym = args[0]
-    rid = args[1]
-    kvs = args[2:]
-
-    items = load_review_items(ym)
-    obj = items.get(rid)
-    if not obj:
-        print(f"Review id not found: {rid}")
-        print(f"Tip: run: python3 sb.py review {ym}")
-        sys.exit(1)
-
-    for kv in kvs:
-        if "=" not in kv:
-            print(f"Bad field (expected key=value): {kv}")
-            sys.exit(1)
-        k, v = kv.split("=", 1)
-        k = k.strip()
-        v = v.strip().strip('"').strip("'")
-        obj[k] = v
-
-    items[rid] = obj
-    save_review_items(ym, items)
-    print(f"Updated {rid} in data/review_{ym}.jsonl")
-def _parse_ym(args: list[str]) -> tuple[int, int, str]:
-    if len(args) < 1 or "-" not in args[0]:
-        print("Usage: sb review YYYY-MM")
-        sys.exit(1)
-    ym = args[0]
-    y_s, m_s = ym.split("-", 1)
-    return int(y_s), int(m_s), ym
-
-
-def cmd_review(args: list[str]) -> None:
-    year, month, ym = _parse_ym(args)
 
     store = SQLiteStore(DB_PATH)
     store.init_db()
@@ -309,7 +181,7 @@ def cmd_review(args: list[str]) -> None:
 
 
 def cmd_review_next(args: list[str]) -> None:
-    year, month, ym = _parse_ym(args)
+    ym = _parse_ym(args, "Usage: sb review-next YYYY-MM")
 
     items = load_review_items(ym)
     nxt = find_next_open(items)
@@ -334,7 +206,7 @@ def cmd_review_next(args: list[str]) -> None:
 
 def cmd_review_set(args: list[str]) -> None:
     if len(args) < 2:
-        print("Usage: sb review-set YYYY-MM <id> key=value [key=value ...]")
+        print('Usage: sb review-set YYYY-MM "<id>" key=value [key=value ...]')
         sys.exit(1)
 
     ym = args[0]
@@ -358,7 +230,84 @@ def cmd_review_set(args: list[str]) -> None:
     save_review_items(ym, items)
     print(f"[review-set] updated {rid}")
 
+
+def cmd_review_status(args: list[str]) -> None:
+    ym = _parse_ym(args, "Usage: sb review-status YYYY-MM")
+
+    items = load_review_items(ym)
+    if not items:
+        print(f"[review-status] No review file found for {ym}. Run: python3 sb.py review {ym}")
+        return
+
+    total = len(items)
+    resolved = [it for it in items.values() if it.get("status") == "resolved"]
+    open_ = [it for it in items.values() if it.get("status", "open") == "open"]
+
+    print(f"[review-status] {ym}")
+    print(f"Open: {len(open_)}  Resolved: {len(resolved)}  Total: {total}")
+
+    by_cat: dict[str, float] = {}
+    by_vendor: dict[str, float] = {}
+
+    for it in resolved:
+        amt = float(it.get("amount") or 0.0)
+        cat = (it.get("category") or "Uncategorized").strip()
+        ven = (it.get("vendor") or "Unknown").strip()
+        by_cat[cat] = by_cat.get(cat, 0.0) + amt
+        by_vendor[ven] = by_vendor.get(ven, 0.0) + amt
+
+    if resolved:
+        print("\nResolved totals by category:")
+        for cat, tot in sorted(by_cat.items(), key=lambda kv: abs(kv[1]), reverse=True):
+            print(f"  {tot:10.2f}  {cat}")
+
+        print("\nResolved totals by vendor:")
+        for ven, tot in sorted(by_vendor.items(), key=lambda kv: abs(kv[1]), reverse=True):
+            print(f"  {tot:10.2f}  {ven}")
+    else:
+        print("\nNo resolved items yet.")
+
+    if open_:
+        print("\nNext open items (preview):")
+
+        def _key(it):
+            return (it.get("posted_date") or "", -(abs(float(it.get("amount") or 0.0))))
+
+        for it in sorted(open_, key=_key)[:10]:
+            print(
+                f"  {it.get('posted_date')}  {float(it.get('amount') or 0.0):10.2f}  {it.get('name')}  ({it.get('reason')})"
+            )
+    else:
+        print("\nAll items resolved ✅")
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        print("Usage: sb <command> [args]")
+        print("Commands: import, months, report, review, review-next, review-set, review-status")
+        sys.exit(1)
+
+    command = sys.argv[1]
+    args = sys.argv[2:]
+
+    if command == "import":
+        cmd_import(args)
+    elif command == "months":
+        cmd_months(args)
+    elif command == "report":
+        cmd_report(args)
+    elif command == "review":
+        cmd_review(args)
+    elif command == "review-next":
+        cmd_review_next(args)
+    elif command == "review-set":
+        cmd_review_set(args)
+    elif command == "review-status":
+        cmd_review_status(args)
+    else:
+        print(f"Unknown command: {command}")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()
-
-
